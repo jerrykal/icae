@@ -1,5 +1,5 @@
 import transformers
-from datasets import load_dataset
+from datasets import load_from_disk
 from peft import (
     LoraConfig,
 )
@@ -12,7 +12,6 @@ from modeling_icae_multi_span import (
 )
 from training_utils import (
     DataCollatorForDynamicPadding,
-    pretrain_tokenize_function,
     train_model,
 )
 
@@ -46,40 +45,14 @@ def main():
         training_args.leave_tokens_for_lm <= training_args.min_tokens_for_lm
     ), "leave_tokens_for_lm should be fewer than min_tokens_for_lm"
 
-    memory_size = training_args.fixed_mem_size
-
-    train_file = "/path/to/train/file"
-    eval_file = "/path/to/dev/file"
-
     print("Loading dataset...")
 
-    dataset = load_dataset(
-        "json", data_files={"train": train_file, "eval": eval_file}, streaming=True
-    )  # streaming can be removed if the dataset is not very large.
-    train_dataset = dataset["train"]
-    eval_dataset = dataset["eval"]
-
     model = ICAE(model_args, training_args, lora_config)
-    MEM_TOKENS = list(range(model.vocab_size, model.vocab_size + memory_size))
 
-    train_dataset = train_dataset.map(
-        pretrain_tokenize_function,
-        batched=True,
-        batch_size=64,
-        fn_kwargs={
-            "model": model,
-            "mem": MEM_TOKENS,
-            "lm_ratio": training_args.lm_ratio,
-        },
-    )
-    eval_dataset = eval_dataset.map(
-        pretrain_tokenize_function,
-        batched=True,
-        fn_kwargs={"model": model, "mem": MEM_TOKENS},
-    )  # don't add lm in the dev set.
+    train_dataset = load_from_disk(data_args.train_data[0])
 
     data_collator = DataCollatorForDynamicPadding(model.pad_token_id)
-    train_model(model, train_dataset, eval_dataset, training_args, data_collator)
+    train_model(model, train_dataset, None, training_args, data_collator)
 
 
 main()

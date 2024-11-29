@@ -1,0 +1,8 @@
+datasets==2.20.0
+flash-attn==2.6.3
+peft==0.11.1
+sentencepiece==0.2.0
+transformers==4.45.1
+protobuf==5.28.3
+deepspeed==0.15.1
+tensorboard

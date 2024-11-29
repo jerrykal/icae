@@ -1,9 +1,27 @@
+import itertools
+import logging
+import math
 import os
 import random
+import re
 
+import numpy as np
 import torch
-from transformers import Trainer
+from datasets import (
+    Dataset,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
+from transformers import (
+    Trainer,
+)
 from transformers.trainer_utils import get_last_checkpoint
+
+from chat_utils import apply_chat_template
+
+logger = logging.getLogger(__name__)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,6 +66,7 @@ def train_model(model, train_dataset, eval_dataset, training_args, data_collator
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        tokenizer=model.tokenizer,
     )
 
     checkpoint = None
@@ -62,9 +81,9 @@ def train_model(model, train_dataset, eval_dataset, training_args, data_collator
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_model()
     trainer.log_metrics("train", train_result.metrics)
-    metrics = trainer.evaluate()
-    trainer.log_metrics("eval", metrics)
-    trainer.save_metrics("eval", metrics)
+    # metrics = trainer.evaluate()
+    # trainer.log_metrics("eval", metrics)
+    # trainer.save_metrics("eval", metrics)
 
 
 def text_extraction(input_ids, length, lm_ratio=0.0):
@@ -82,7 +101,7 @@ def text_extraction(input_ids, length, lm_ratio=0.0):
 
     # lm
     if input_len <= length:
-        r = random.randint(0, input_len - 1)
+        r = random.randint(1024, input_len - 1)
         return input_ids[: r + 1], input_ids[r + 1 :]
     else:
         last_start = input_len - length
@@ -92,26 +111,44 @@ def text_extraction(input_ids, length, lm_ratio=0.0):
         ]
 
 
-def pretrain_tokenize_function(examples, model, mem, lm_ratio=0.0):
-    text_output = model.tokenizer(
-        examples["text"], truncation=False, padding=False, return_attention_mask=False
-    )
+def compute_num_segments(total_length, mem_size, mean_compression_rate):
+    assert total_length > 0
+    num_segments = math.ceil(total_length / (mem_size * mean_compression_rate))
+    return num_segments
+
+
+def pretrain_tokenize_function(
+    examples, tokenizer, training_args, ae_token_id, lm_token_id, eos_id, mem, lm_ratio
+):
+    if "text" in examples.keys():
+        text_output = tokenizer(
+            examples["text"],
+            truncation=False,
+            padding=False,
+            return_attention_mask=False,
+        )
+    elif "input_ids" in examples.keys():
+        text_output = examples
+    else:
+        raise ValueError("Found neither 'text' nor 'input_ids' in the training data!")
+
     text_output["prompt_answer_ids"] = []
     text_output["labels"] = []
 
-    max_len = model.training_args.model_max_length  # heuristic
+    max_len = training_args.model_max_length  # heuristic
 
     for idx in range(len(text_output["input_ids"])):
         ae = True
         a, b = text_extraction(
             text_output["input_ids"][idx], max_len, lm_ratio=lm_ratio
         )
-        length_a = len(a)
-        num_segments = model.compute_num_segments(length_a)
-        total_mem_length = num_segments * model.mem_size
+        num_segments = compute_num_segments(
+            len(a), training_args.fixed_mem_size, training_args.mean_compression_rate
+        )
+        total_mem_length = num_segments * training_args.fixed_mem_size
 
         if (
-            len(b) > model.training_args.min_tokens_for_lm
+            len(b) > training_args.min_tokens_for_lm
         ):  # avoid too few tokens for lm, which is a waste of computing
             ae = False
             b = b[:max_len]
@@ -120,12 +157,12 @@ def pretrain_tokenize_function(examples, model, mem, lm_ratio=0.0):
 
         # decoder part: note that in v2, we add mem_tokens to the prompt_ids for easy implementation; which is different from v1 implementation where mem tokens are not in the prompt_ids
         if ae:  # autoencoding objective
-            prompt_ids = [mem[0]] * total_mem_length + [model.ae_token_id]
-            answer_ids = a + [model.eos_id]  # if ae, eos token
+            prompt_ids = [mem[0]] * total_mem_length + [ae_token_id]
+            answer_ids = a + [eos_id]  # if ae, eos token
         else:  # lm objective
             prompt_ids = [mem[0]] * total_mem_length
-            if model.training_args.add_special_token_for_lm:
-                prompt_ids += [model.lm_token_id]
+            if training_args.add_special_token_for_lm:
+                prompt_ids += [lm_token_id]
             answer_ids = b  # if lm, no eos token
 
         text_output["prompt_answer_ids"].append(prompt_ids + answer_ids)
@@ -134,8 +171,8 @@ def pretrain_tokenize_function(examples, model, mem, lm_ratio=0.0):
         else:
             labels = (
                 [-100] * len(prompt_ids)
-                + [-100] * model.training_args.leave_tokens_for_lm
-                + answer_ids[model.training_args.leave_tokens_for_lm :]
+                + [-100] * training_args.leave_tokens_for_lm
+                + answer_ids[training_args.leave_tokens_for_lm :]
             )  # no loss for leave_tokens_for_lm
         text_output["labels"].append(labels)
         assert len(text_output["prompt_answer_ids"][-1]) == len(labels)
@@ -143,55 +180,73 @@ def pretrain_tokenize_function(examples, model, mem, lm_ratio=0.0):
     return text_output
 
 
-def instruct_ft_tokenize_function(examples, model, mem):
-    text_output = model.tokenizer(
-        examples["input"],
-        max_length=5120,
-        truncation=True,
-        padding=False,
-        return_attention_mask=False,
-        add_special_tokens=False,
-    )
-    prompt_output = model.tokenizer(
-        examples["prompt"],
-        truncation=False,
-        padding=False,
-        return_attention_mask=False,
-        add_special_tokens=False,
-    )
-    label_output = model.tokenizer(
-        examples["answer"],
-        truncation=False,
-        padding=False,
-        return_attention_mask=False,
-        add_special_tokens=False,
-    )
-    text_output["prompt_answer_ids"] = []
-    text_output["labels"] = []
+def instruct_ft_tokenize_function(
+    examples, tokenizer, training_args, ft_token_id, eos_id, mem
+):
+    text_output = {
+        "input_ids": [],
+        "prompt_answer_ids": [],
+        "labels": [],
+    }
 
-    max_len = model.training_args.model_max_length  # heuristic
+    maxlen = training_args.model_max_length
+    minlen = training_args.model_min_length
 
-    for idx in range(len(text_output["input_ids"])):
-        length = len(text_output["input_ids"][idx])
-        num_segments = model.compute_num_segments(length)
-        total_mem_length = num_segments * model.mem_size
+    for conversation in examples["conversations"]:
+        # Skip the first one if it is not from user
+        if conversation[0]["role"] != "user":
+            conversation = conversation[1:]
 
-        prompt_ids = (
-            [mem[0]] * total_mem_length
-            + [model.ft_token_id]
-            + prompt_output["input_ids"][idx]
-        )
-        prompt_ids = (
-            [1, 733, 16289, 28793] + prompt_ids + [733, 28748, 16289, 28793]
-        )  # special formats for prompt in Mistral
-        answer_ids = label_output["input_ids"][idx] + [model.eos_id]
+        encoded = apply_chat_template(
+            training_args.chat_template,
+            conversation,
+            tokenizer=tokenizer,
+            return_labels=True,
+        ).encoded
 
-        text_output["prompt_answer_ids"].append(prompt_ids + answer_ids)
+        # Make sure the conversation is between minlen and maxlen
+        if minlen is not None and len(encoded["input_ids"]) < minlen:
+            continue
+        if maxlen is not None and len(encoded["input_ids"]) > maxlen:
+            continue
 
-        labels = [-100] * len(prompt_ids) + answer_ids
-        text_output["labels"].append(labels)
+        segment_lengths = [
+            len(list(segment))
+            for _, segment in itertools.groupby(np.array(encoded["labels"]) == -100)
+        ]
+        assert sum(segment_lengths) == len(encoded["labels"])
 
-        assert len(text_output["prompt_answer_ids"][-1]) == len(labels)
+        curr_pos = 0
+        input_ids = []
+        last_input_id = []
+
+        for i, segment_length in enumerate(segment_lengths):
+            segment_input_ids = encoded["input_ids"][
+                curr_pos : curr_pos + segment_length
+            ]
+
+            if i % 2 == 0 and len(input_ids) > 0:
+                num_segments = compute_num_segments(
+                    len(input_ids),
+                    training_args.fixed_mem_size,
+                    training_args.mean_compression_rate,
+                )
+                total_mem_length = num_segments * training_args.fixed_mem_size
+
+                prompt_ids = [mem[0]] * total_mem_length + [ft_token_id] + last_input_id
+                answer_ids = segment_input_ids + [eos_id]
+
+                labels = [-100] * len(prompt_ids) + answer_ids
+
+                text_output["input_ids"].append(input_ids.copy())
+                text_output["prompt_answer_ids"].append(prompt_ids + answer_ids)
+                text_output["labels"].append(labels)
+
+                assert len(text_output["prompt_answer_ids"][-1]) == len(labels)
+
+            input_ids.extend(last_input_id)
+            last_input_id = segment_input_ids
+            curr_pos += segment_length
 
     return text_output
 
@@ -236,3 +291,118 @@ class DataCollatorForDynamicPadding:
         for i, seq in enumerate(sequences):
             padded_sequences[i, : len(seq)] = seq
         return padded_sequences
+
+
+def prepare_train_data(
+    model,
+    mem,
+    lm_ratio,
+    data_files: list | str = None,
+    seed: int = 42,
+    cache_dir: str | None = None,
+    load_from_cache_file: bool | None = None,
+) -> Dataset:
+    if data_files is None:
+        return None
+
+    if isinstance(data_files, list):
+        logger.info(f"Loading training data from {data_files}...")
+    elif isinstance(data_files, str):
+        logger.info(f"Loading training data from {data_files}...")
+        data_files = [data_files]
+    else:
+        raise ValueError(f"Invalid training data {data_files}!")
+
+    data_2_num_sample = {}
+    for data_file in data_files:
+        match = re.search("\[(\d*)\]", data_file)
+        if match:
+            max_sample_num = int(match.group(1))
+            data_file = re.sub("\[(\d*)\]", "", data_file)
+        else:
+            max_sample_num = None
+        data_2_num_sample[data_file] = max_sample_num
+
+    random.seed(seed)
+
+    train_datasets = []
+    for data_file, max_sample_num in data_2_num_sample.items():
+        print(f"Processing {data_file}...")
+        if os.path.isdir(data_file) and os.path.exists(
+            os.path.join(data_file, "dataset_info.json")
+        ):
+            # the dataset may be save_to_disk in advance
+            dataset = load_from_disk(data_file)
+            column_names = [
+                col
+                for col in dataset.column_names
+                if col != "input_ids" and col != "labels"
+            ]
+            map_fn = pretrain_tokenize_function
+            fn_kwargs = {
+                "tokenizer": model.tokenizer,
+                "training_args": model.training_args,
+                "ae_token_id": model.ae_token_id,
+                "lm_token_id": model.lm_token_id,
+                "eos_id": model.eos_id,
+                "mem": mem,
+                "lm_ratio": lm_ratio,
+            }
+
+        else:
+            # the dataset is a json file
+            dataset = load_dataset(
+                "json", data_files=data_file, split="train", cache_dir=cache_dir
+            )
+
+            column_names = dataset.column_names
+            if "text" in column_names:
+                map_fn = pretrain_tokenize_function
+                fn_kwargs = {
+                    "tokenizer": model.tokenizer,
+                    "training_args": model.training_args,
+                    "ae_token_id": model.ae_token_id,
+                    "lm_token_id": model.lm_token_id,
+                    "eos_id": model.eos_id,
+                    "mem": mem,
+                    "lm_ratio": lm_ratio,
+                }
+            # TODO: add instruction tuning preprocessing later
+            elif "conversations" in column_names:
+                map_fn = instruct_ft_tokenize_function
+                fn_kwargs = {
+                    "tokenizer": model.tokenizer,
+                    "training_args": model.training_args,
+                    "ft_token_id": model.ft_token_id,
+                    "eos_id": model.eos_id,
+                    "mem": mem,
+                }
+            else:
+                raise ValueError(
+                    "Found neither 'text' nor 'conversations' in the training data!"
+                )
+
+        dataset = dataset.map(
+            map_fn,
+            batched=True,
+            num_proc=32,
+            remove_columns=column_names,
+            batch_size=32,
+            load_from_cache_file=load_from_cache_file,
+            fn_kwargs=fn_kwargs,
+        )
+
+        if max_sample_num is not None and len(dataset) > max_sample_num:
+            dataset = dataset.train_test_split(max_sample_num, seed=seed)["test"]
+
+        # index column is useless in training
+        if "index" in dataset.column_names:
+            dataset = dataset.remove_columns(["index"])
+
+        print(f"Dataset length: {len(dataset)}")
+
+        train_datasets.append(dataset)
+
+    dataset = concatenate_datasets(train_datasets)
+
+    return dataset

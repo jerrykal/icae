@@ -31,14 +31,14 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(
-        default=None, metadata={"help": "Path to the training data."}
+    train_data: list[str] | None = field(
+        default=None, metadata={"help": "Path to the training dataset."}
     )
-    debug_data: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable debug dataset to quickly verify the training process"
-        },
+    eval_data: list[str] | None = field(
+        default=None, metadata={"help": "Path to the evaluation dataset."}
+    )
+    dataset_cache_dir: str | None = field(
+        default=None, metadata={"help": "The cache directory for the dataset."}
     )
 
 
@@ -47,10 +47,12 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=28000,
-        metadata={
-            "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
-        },
+        default=20480,
+        metadata={"help": "Maximum sequence length."},
+    )
+    model_min_length: int = field(
+        default=2048,
+        metadata={"help": "Minimum sequence length."},
     )
     fixed_mem_size: int = field(
         default=128,
@@ -83,6 +85,9 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={
             "help": "The checkpoint that should be restored from for fine-tuning"
         },
+    )
+    chat_template: str = field(
+        default="llama-3", metadata={"help": "Instruction template name in fastchat."}
     )
 
 
@@ -117,7 +122,7 @@ class ICAE(torch.nn.Module):
             torch_dtype=torch.float16
             if training_args.bf16 is False
             else torch.bfloat16,
-            use_flash_attention_2=True,
+            attn_implementation="flash_attention_2",
             resume_download=True,
         )
 
@@ -129,7 +134,7 @@ class ICAE(torch.nn.Module):
                 torch_dtype=torch.float16
                 if training_args.bf16 is False
                 else torch.bfloat16,
-                use_flash_attention_2=True,
+                attn_implementation="flash_attention_2",
                 resume_download=True,
             )
 
@@ -150,10 +155,6 @@ class ICAE(torch.nn.Module):
 
         self.icae.resize_token_embeddings(self.vocab_size_with_mem + 3)
 
-        # special tokens for Llama-2/Mistral tokenizer
-        self.bos_id = 1
-        self.eos_id = 2
-
         self.dim = self.icae.config.hidden_size
         self.icae = get_peft_model(self.icae, lora_config)
 
@@ -170,6 +171,9 @@ class ICAE(torch.nn.Module):
             dtype=torch.long,
             device=device,
         ).unsqueeze(0)  # mem tokens
+
+        self.bos_id = self.tokenizer.bos_token_id
+        self.eos_id = self.tokenizer.eos_token_id
 
         if self.training:
             self.init()
@@ -208,6 +212,10 @@ class ICAE(torch.nn.Module):
         prompt_answer_ids: torch.LongTensor = None,
         labels: Optional[torch.LongTensor] = None,
     ):
+        # Log input_ids length to a file
+        with open("input_ids_length.txt", "a") as f:
+            f.write(f"{input_ids.size(1)}\n")
+
         # encoder part
         batch_size = input_ids.size(0)
         total_length = input_ids.size(1)
